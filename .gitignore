@@ -1,0 +1,30 @@
+# Muhit o'zgaruvchilar — hech qachon git ga yuklanmasin
+.env
+
+# SQLite baza fayli
+*.db
+*.db-wal
+*.db-shm
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual muhit
+venv/
+env/
+.venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log fayllar
+*.log
+logs/
