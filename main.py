@@ -48,7 +48,7 @@ AD_DELAY    = 0.05
 PAGE_SIZE   = 20
 
 MOVIES_LIST_TEXT = (
-    "Kinolar ro’yxati quyidagi kodlar bilan joylangan![👇](https://fonts.gstatic.com/s/e/notoemoji/17.0/1f447/32.png)\n\n"
+    "Kinolar ro’yxati quyidagi kodlar bilan joylangan 👇\n\n"
     "1 dan 1000 gacha YEVROPISKI\n"
     "1000 dan 2000 gacha UZBEKCHA\n"
     "2000 dan 3000 gacha ZAPALLAR\n"
