@@ -7,7 +7,9 @@ import logging
 import os
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+from functools import partial
 
+from aiohttp import web
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
@@ -30,15 +32,35 @@ ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi!")
 
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8000")))
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/webhook/{BOT_TOKEN}")
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+WEBHOOK_FULL_URL = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH if WEBHOOK_URL else ""
+
 MOVIE_PRICE = 200
 BASE_DIR    = Path(__file__).resolve().parent
 DB_PATH     = str(BASE_DIR / "bot.db")
+DB_CONN = None
 AD_DELAY    = 0.05
 PAGE_SIZE   = 20
 
-logging.basicConfig(level=logging.INFO,
+MOVIES_LIST_TEXT = (
+    "Kinolar ro’yxati quyidagi kodlar bilan joylangan![👇](https://fonts.gstatic.com/s/e/notoemoji/17.0/1f447/32.png)\n\n"
+    "1 dan 1000 gacha YEVROPISKI\n"
+    "1000 dan 2000 gacha UZBEKCHA\n"
+    "2000 dan 3000 gacha ZAPALLAR\n"
+    "3000 dan 4000 gacha DETSKI\n\n"
+    "Har bir kino uchun hisobingizdan 200 so’m dan yechiladi."
+)
+
+logging.basicConfig(level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger(__name__)
+logging.getLogger("aiogram").setLevel(logging.ERROR)
+logging.getLogger("aiogram.dispatcher").setLevel(logging.ERROR)
 
 # ═══════════════════════════════════════════════════════
 # YORDAMCHI FUNKSIYALAR
@@ -155,89 +177,86 @@ class SMLText(StatesGroup):
 # DATABASE
 # ═══════════════════════════════════════════════════════
 async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Performance optimizations for large-scale (100K+ users)
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA synchronous=NORMAL")
-        await db.execute("PRAGMA cache_size=-64000")  # 64MB cache
-        await db.execute("PRAGMA temp_store=MEMORY")
-        await db.execute("PRAGMA mmap_size=30000000")  # Memory-mapped I/O
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT    DEFAULT '',
-                full_name   TEXT    DEFAULT '',
-                balance     INTEGER DEFAULT 0,
-                total_topup INTEGER DEFAULT 0,
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS movies (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                code      TEXT UNIQUE NOT NULL,
-                title     TEXT NOT NULL,
-                file_id   TEXT NOT NULL,
-                file_type TEXT NOT NULL DEFAULT 'video',
-                added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                amount     INTEGER NOT NULL,
-                status     TEXT    DEFAULT 'pending',
-                receipt_id TEXT    DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                amount     INTEGER NOT NULL,
-                type       TEXT    NOT NULL,
-                note       TEXT    DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT DEFAULT ''
-            )""")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pu ON payments(user_id)")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ps ON payments(status)")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mc ON movies(code)")
-        try:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN total_topup INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        # Eski DB da receipt_id ustuni yo'q bo'lishi mumkin
-        try:
-            await db.execute(
-                "ALTER TABLE payments ADD COLUMN receipt_id TEXT DEFAULT ''")
-        except Exception:
-            pass
-        try:
-            async with db.execute("PRAGMA table_info(transactions)") as cur:
-                cols = [row[1] for row in await cur.fetchall()]
-            if "note" not in cols:
-                await db.execute(
-                    "ALTER TABLE transactions ADD COLUMN note TEXT DEFAULT ''")
-        except Exception:
-            pass
-        # Kinolar ro'yxati uchun e'lon (matn) jadval
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS movie_list_text (
-                id    INTEGER PRIMARY KEY DEFAULT 1,
-                txt   TEXT    DEFAULT ''
-            )""")
-        # Default qator bo'lmasa qo'shamiz
-        await db.execute(
-            "INSERT OR IGNORE INTO movie_list_text(id,txt) VALUES(1,'')")
-        await db.commit()
+    global DB_CONN
+    # Create a single shared connection for better performance under load
+    DB_CONN = await aiosqlite.connect(DB_PATH)
+    db = DB_CONN
+    # Performance optimizations for large-scale (100K+ users)
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA cache_size=-64000")  # 64MB cache
+    await db.execute("PRAGMA temp_store=MEMORY")
+    await db.execute("PRAGMA mmap_size=30000000")  # Memory-mapped I/O
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT    DEFAULT '',
+            full_name   TEXT    DEFAULT '',
+            balance     INTEGER DEFAULT 0,
+            total_topup INTEGER DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS movies (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            code      TEXT UNIQUE NOT NULL,
+            title     TEXT NOT NULL,
+            file_id   TEXT NOT NULL,
+            file_type TEXT NOT NULL DEFAULT 'video',
+            added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            amount     INTEGER NOT NULL,
+            status     TEXT    DEFAULT 'pending',
+            receipt_id TEXT    DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            amount     INTEGER NOT NULL,
+            type       TEXT    NOT NULL,
+            note       TEXT    DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        )""")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_pu ON payments(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_ps ON payments(status)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_mc ON movies(code)")
+    try:
+        await db.execute("ALTER TABLE users ADD COLUMN total_topup INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    # Eski DB da receipt_id ustuni yo'q bo'lishi mumkin
+    try:
+        await db.execute("ALTER TABLE payments ADD COLUMN receipt_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        async with db.execute("PRAGMA table_info(transactions)") as cur:
+            cols = [row[1] for row in await cur.fetchall()]
+        if "note" not in cols:
+            await db.execute("ALTER TABLE transactions ADD COLUMN note TEXT DEFAULT ''")
+    except Exception:
+        pass
+    # Kinolar ro'yxati uchun e'lon (matn) jadval
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS movie_list_text (
+            id    INTEGER PRIMARY KEY DEFAULT 1,
+            txt   TEXT    DEFAULT ''
+        )""")
+    # Default qator bo'lmasa qo'shamiz
+    await db.execute("INSERT OR IGNORE INTO movie_list_text(id,txt) VALUES(1,'')")
+    await db.commit()
 
 # ── yordamchi ─────────────────────────────────────────
 def esc(v) -> str:
@@ -246,104 +265,104 @@ def esc(v) -> str:
 async def cfg_get(key: str, default: str = "") -> str:
     """Sozlamalarni o'qish (cache bilan)."""
     if key not in _cache["cfg"]:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                    "SELECT value FROM settings WHERE key=?", (key,)) as c:
-                r = await c.fetchone()
-                val = r[0] if r else default
+        db = DB_CONN
+        async with db.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)) as c:
+            r = await c.fetchone()
+            val = r[0] if r else default
         _cache["cfg"][key] = val
     return _cache["cfg"][key]
 
 async def cfg_set(key: str, val: str):
     """Sozlamalarni yozish va cache invalidate qilish."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, val))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, val))
+    await db.commit()
     _cache["cfg"][key] = val  # Inline cache update
 
 # ── users ──────────────────────────────────────────────
 async def user_upsert(uid: int, uname: str, fname: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "INSERT OR IGNORE INTO users(user_id,username,full_name)"
-            " VALUES(?,?,?)", (uid, uname, fname))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "INSERT OR IGNORE INTO users(user_id,username,full_name)"
+        " VALUES(?,?,?)", (uid, uname, fname))
+    await db.commit()
 
 async def user_bal(uid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-                "SELECT balance FROM users WHERE user_id=?", (uid,)) as c:
-            r = await c.fetchone()
-            return int(r[0]) if r else 0
+    db = DB_CONN
+    async with db.execute(
+            "SELECT balance FROM users WHERE user_id=?", (uid,)) as c:
+        r = await c.fetchone()
+        return int(r[0]) if r else 0
 
 async def bal_add(uid: int, amt: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "UPDATE users SET balance=balance+? WHERE user_id=?", (amt, uid))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "UPDATE users SET balance=balance+? WHERE user_id=?", (amt, uid))
+    await db.commit()
 
 async def bal_deduct(uid: int, amt: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        c = await db.execute(
-            "UPDATE users SET balance=balance-?"
-            " WHERE user_id=? AND balance>=?", (amt, uid, amt))
-        await db.commit()
-        return c.rowcount > 0
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    c = await db.execute(
+        "UPDATE users SET balance=balance-?"
+        " WHERE user_id=? AND balance>=?", (amt, uid, amt))
+    await db.commit()
+    return c.rowcount > 0
 
 async def users_all():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                "SELECT * FROM users ORDER BY created_at DESC") as c:
-            return await c.fetchall()
+    db = DB_CONN
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+            "SELECT * FROM users ORDER BY created_at DESC") as c:
+        return await c.fetchall()
 
 async def users_ids() -> List[int]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users") as c:
-            return [int(r[0]) for r in await c.fetchall()]
+    db = DB_CONN
+    async with db.execute("SELECT user_id FROM users") as c:
+        return [int(r[0]) for r in await c.fetchall()]
 
 async def users_count() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c:
-            r = await c.fetchone()
-            return int(r[0]) if r else 0
+    db = DB_CONN
+    async with db.execute("SELECT COUNT(*) FROM users") as c:
+        r = await c.fetchone()
+        return int(r[0]) if r else 0
 
 async def total_bal() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-                "SELECT COALESCE(SUM(balance),0) FROM users") as c:
-            r = await c.fetchone()
-            return int(r[0]) if r else 0
+    db = DB_CONN
+    async with db.execute(
+            "SELECT COALESCE(SUM(balance),0) FROM users") as c:
+        r = await c.fetchone()
+        return int(r[0]) if r else 0
 
 async def total_topup() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM payments"
-                " WHERE status='approved'") as c:
-            r = await c.fetchone()
-            return int(r[0]) if r else 0
+    db = DB_CONN
+    async with db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payments"
+            " WHERE status='approved'") as c:
+        r = await c.fetchone()
+        return int(r[0]) if r else 0
 
 # ── movies ─────────────────────────────────────────────
 async def movie_save(code: str, title: str, fid: str, ftype: str = "video"):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "INSERT OR REPLACE INTO movies(code,title,file_id,file_type)"
-            " VALUES(?,?,?,?)", (code, title, fid, ftype))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "INSERT OR REPLACE INTO movies(code,title,file_id,file_type)"
+        " VALUES(?,?,?,?)", (code, title, fid, ftype))
+    await db.commit()
     cache_invalidate("movies")  # Cache invalidate
 
 async def movie_get(code: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                "SELECT * FROM movies WHERE code=?", (code,)) as c:
-            return await c.fetchone()
+    db = DB_CONN
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+            "SELECT * FROM movies WHERE code=?", (code,)) as c:
+        return await c.fetchone()
 
 async def movies_all():
     """Barcha kinolarni qaytarish (keshirish bilan)."""
@@ -353,20 +372,20 @@ async def movies_all():
     if _cache["movies_all"] and (now - _cache["movies_all_ts"] < 5):
         return _cache["movies_all"]
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM movies ORDER BY id") as c:
-            result = await c.fetchall()
+    db = DB_CONN
+    db.row_factory = aiosqlite.Row
+    async with db.execute("SELECT * FROM movies ORDER BY id") as c:
+        result = await c.fetchall()
     _cache["movies_all"] = result
     _cache["movies_all_ts"] = now
     return result
 
 async def movie_del(code: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        c = await db.execute("DELETE FROM movies WHERE code=?", (code,))
-        await db.commit()
-        ok = c.rowcount > 0
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    c = await db.execute("DELETE FROM movies WHERE code=?", (code,))
+    await db.commit()
+    ok = c.rowcount > 0
     if ok:
         cache_invalidate("movies")  # Cache invalidate
     return ok
@@ -379,94 +398,94 @@ async def ml_text_get() -> str:
     if _cache["ml_text"] is not None and (now - _cache["ml_text_ts"] < 10):
         return _cache["ml_text"]
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-                "SELECT txt FROM movie_list_text WHERE id=1") as cur:
-            r = await cur.fetchone()
-            txt = r[0] if r else ""
+    db = DB_CONN
+    async with db.execute(
+            "SELECT txt FROM movie_list_text WHERE id=1") as cur:
+        r = await cur.fetchone()
+        txt = r[0] if r else ""
     _cache["ml_text"] = txt
     _cache["ml_text_ts"] = now
     return txt
 
 async def ml_text_set(txt: str):
     """Kinolar ro'yxati e'lonini saqlash va cache invalidate qilish."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "INSERT OR REPLACE INTO movie_list_text(id,txt) VALUES(1,?)",
-            (txt,))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "INSERT OR REPLACE INTO movie_list_text(id,txt) VALUES(1,?)",
+        (txt,))
+    await db.commit()
     cache_invalidate("text")  # Cache invalidate
 
 # ── payments ───────────────────────────────────────────
 async def pay_new(uid: int, amt: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        c = await db.execute(
-            "INSERT INTO payments(user_id,amount,status)"
-            " VALUES(?,?,'pending')", (uid, amt))
-        await db.commit()
-        return int(c.lastrowid) if c.lastrowid else 0
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    c = await db.execute(
+        "INSERT INTO payments(user_id,amount,status)"
+        " VALUES(?,?,'pending')", (uid, amt))
+    await db.commit()
+    return int(c.lastrowid) if c.lastrowid else 0
 
 async def pay_set_rcpt(pid: int, fid: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "UPDATE payments SET receipt_id=?"
-            " WHERE id=? AND status='pending'", (fid, pid))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "UPDATE payments SET receipt_id=?"
+        " WHERE id=? AND status='pending'", (fid, pid))
+    await db.commit()
 
 async def pay_get(pid: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                "SELECT * FROM payments WHERE id=?", (pid,)) as c:
-            return await c.fetchone()
+    db = DB_CONN
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+            "SELECT * FROM payments WHERE id=?", (pid,)) as c:
+        return await c.fetchone()
 
 async def pay_approve(pid: int) -> Optional[Tuple[int, int]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        async with db.execute(
-                "SELECT user_id,amount FROM payments"
-                " WHERE id=? AND status='pending'", (pid,)) as c:
-            row = await c.fetchone()
-            if not row:
-                return None
-            uid, amt = int(row[0]), int(row[1])
-        await db.execute(
-            "UPDATE payments SET status='approved' WHERE id=?", (pid,))
-        await db.execute(
-            "UPDATE users SET balance=balance+?,"
-            " total_topup=total_topup+? WHERE user_id=?",
-            (amt, amt, uid))
-        await db.execute(
-            "INSERT INTO transactions(user_id,amount,type,note)"
-            " VALUES(?,?,'topup',?)", (uid, amt, f"To'lov #{pid}"))
-        await db.commit()
-        return uid, amt
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    async with db.execute(
+            "SELECT user_id,amount FROM payments"
+            " WHERE id=? AND status='pending'", (pid,)) as c:
+        row = await c.fetchone()
+        if not row:
+            return None
+        uid, amt = int(row[0]), int(row[1])
+    await db.execute(
+        "UPDATE payments SET status='approved' WHERE id=?", (pid,))
+    await db.execute(
+        "UPDATE users SET balance=balance+?,"
+        " total_topup=total_topup+? WHERE user_id=?",
+        (amt, amt, uid))
+    await db.execute(
+        "INSERT INTO transactions(user_id,amount,type,note)"
+        " VALUES(?,?,'topup',?)", (uid, amt, f"To'lov #{pid}"))
+    await db.commit()
+    return uid, amt
 
 async def pay_reject(pid: int) -> Optional[Tuple[int, int]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        async with db.execute(
-                "SELECT user_id,amount FROM payments"
-                " WHERE id=? AND status='pending'", (pid,)) as c:
-            row = await c.fetchone()
-            if not row:
-                return None
-            uid, amt = int(row[0]), int(row[1])
-        await db.execute(
-            "UPDATE payments SET status='rejected' WHERE id=?", (pid,))
-        await db.commit()
-        return uid, amt
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    async with db.execute(
+            "SELECT user_id,amount FROM payments"
+            " WHERE id=? AND status='pending'", (pid,)) as c:
+        row = await c.fetchone()
+        if not row:
+            return None
+        uid, amt = int(row[0]), int(row[1])
+    await db.execute(
+        "UPDATE payments SET status='rejected' WHERE id=?", (pid,))
+    await db.commit()
+    return uid, amt
 
 async def tx_add(uid: int, amt: int, tp: str, note: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(
-            "INSERT INTO transactions(user_id,amount,type,note)"
-            " VALUES(?,?,?,?)", (uid, amt, tp, note))
-        await db.commit()
+    db = DB_CONN
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(
+        "INSERT INTO transactions(user_id,amount,type,note)"
+        " VALUES(?,?,?,?)", (uid, amt, tp, note))
+    await db.commit()
 
 # ═══════════════════════════════════════════════════════
 # TUGMALAR
@@ -483,7 +502,6 @@ def kb_admin() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     kb.button(text="🎬 Kino qo'shish")
     kb.button(text="📋 Kinolar ro'yxati")
-    kb.button(text="📝 Ro'yxat e'loni")
     kb.button(text="✏️ Kinoni tahrirlash")
     kb.button(text="🗑 Kinoni o'chirish")
     kb.button(text="💳 Karta sozlamalari")
@@ -681,14 +699,8 @@ async def show_bal(msg: Message):
 
 @router.message(F.text == "🎬 Kinolar ro'yxati")
 async def movies_list(msg: Message):
-    uid  = msg.from_user.id
-    mvs  = await movies_all()
-    is_a = uid == ADMIN_ID
-    text, markup = movies_page_markup(mvs, 0, is_a)
-    ml = await ml_text_get()
-    if ml:
-        text = text + "\n\n" + esc(ml)
-    await msg.answer(text, reply_markup=markup)
+    uid = msg.from_user.id
+    await msg.answer(MOVIES_LIST_TEXT, reply_markup=menu(uid), parse_mode=ParseMode.MARKDOWN)
 
 @router.message(F.text == "📋 Kinolar ro'yxati")
 async def admin_movies_list(msg: Message):
@@ -696,9 +708,6 @@ async def admin_movies_list(msg: Message):
         return
     mvs  = await movies_all()
     text, markup = movies_page_markup(mvs, 0, True)
-    ml = await ml_text_get()
-    if ml:
-        text = text + "\n\n" + esc(ml)
     await msg.answer(text, reply_markup=markup)
 
 @router.callback_query(F.data.startswith("ML:page:"))
@@ -727,26 +736,6 @@ async def ml_add(call: CallbackQuery, state: FSMContext):
         "🎬 <b>Kino qo'shish</b>\n\n"
         "1️⃣ Kino <b>kodini</b> yozing (masalan: <code>001</code>):")
 
-
-@router.message(F.text == "📝 Ro'yxat e'loni")
-async def ml_text_edit(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    await state.set_state(SMLText.text)
-    cur = await ml_text_get()
-    hint = f"\nHozirgi matn:\n{cur}\n\n" if cur else "\n"
-    await msg.answer(
-        "📝 <b>Kinolar ro'yxati e'lonini</b> yozing:" + hint)
-
-
-@router.message(SMLText.text)
-async def ml_text_save(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    txt = (msg.text or "").strip()
-    await ml_text_set(txt)
-    await state.clear()
-    await msg.answer("✅ <b>E'lon yangilandi!</b>", reply_markup=kb_admin())
 
 @router.callback_query(F.data == "ML:edit")
 async def ml_edit(call: CallbackQuery, state: FSMContext):
@@ -1505,9 +1494,10 @@ async def catch_code(msg: Message, state: FSMContext, bot: Bot):
     code  = msg.text.strip()
     movie = await movie_get(code)
     if not movie:
+        # Kino topilmaganda xabar berish (ro'yxat matnini ko'rsatmaslik)
         await msg.answer(
-            f"❌ <code>{esc(code)}</code> kodli kino topilmadi.\n\n"
-            "«🎬 Kinolar ro'yxati» tugmasini bosib ro'yxatni ko'ring.",
+            "❌ <b>Kino kodi topilmadi.</b>\n\n"
+            "🎬 Kinolar ro'yxatini ko'rish uchun «🎬 Kinolar ro'yxati» tugmasini bosing.",
             reply_markup=kb_user())
         return
     await _give_movie(msg, bot, uid, movie)
@@ -1583,6 +1573,28 @@ async def _give_movie(msg: Message, bot: Bot, uid: int, movie):
 # MAIN
 # ═══════════════════════════════════════════════════════
 
+async def _handle_webhook(request, bot: Bot, dp: Dispatcher):
+    if request.method != 'POST':
+        return web.Response(status=405)
+    try:
+        update = await request.json()
+    except Exception:
+        return web.Response(status=400, text='bad request')
+    try:
+        # Do not await feed_raw_update to avoid blocking the HTTP response
+        # Use a safe wrapper to catch exceptions from background tasks
+        asyncio.create_task(_process_update(dp, bot, update))
+    except Exception as e:
+        log.exception("Webhook dispatch error: %s", e)
+        return web.Response(status=500, text='internal error')
+    return web.Response(text='OK')
+
+async def _process_update(dp: Dispatcher, bot: Bot, update: dict):
+    try:
+        await dp.feed_raw_update(bot=bot, update=update)
+    except Exception as e:
+        log.exception("Unhandled exception while processing webhook update: %s", e)
+
 async def main():
     await db_init()
     log.info("DB tayyor.")
@@ -1590,14 +1602,47 @@ async def main():
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    log.info("Bot ishga tushmoqda...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    try:
-        await dp.start_polling(
-            bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        await bot.session.close()
-        log.info("Bot to'xtatildi.")
 
-if __name__ == "__main__":
+    if WEBHOOK_FULL_URL:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(WEBHOOK_FULL_URL)
+
+        app = web.Application()
+        app.router.add_post(WEBHOOK_PATH,
+                            partial(_handle_webhook, bot=bot, dp=dp))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
+        await site.start()
+
+        log.info("Webhook ishga tushdi: %s", WEBHOOK_FULL_URL)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await runner.cleanup()
+            if DB_CONN:
+                try:
+                    await DB_CONN.close()
+                except Exception:
+                    log.exception("Error closing DB_CONN")
+            await bot.session.close()
+    else:
+        await bot.delete_webhook(drop_pending_updates=True)
+        try:
+            await dp.start_polling(
+                bot, allowed_updates=dp.resolve_used_update_types())
+        finally:
+            if DB_CONN:
+                try:
+                    await DB_CONN.close()
+                except Exception:
+                    log.exception("Error closing DB_CONN")
+            await bot.session.close()
+    log.info("Bot to'xtatildi.")
+
+
+if __name__ == '__main__':
+    import asyncio
     asyncio.run(main())
+
